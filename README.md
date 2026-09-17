@@ -1,4 +1,4 @@
-# roblox-capctha-solver
+# roblox-captcha-solver
 
 Local human-in-the-loop Roblox verification diagnostic tool and
 ZeroSolver-compatible HTTP API.
