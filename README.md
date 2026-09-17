@@ -25,6 +25,16 @@ Start the API:
 python zerosolver_api.py
 ```
 
+Inspect one gamejoin challenge without solving or continuing it:
+
+```powershell
+python inspect_gamejoin_challenge.py --place-id 2809202155
+```
+
+The cookie is requested through hidden console input and is never printed. The
+script prints the request details, response status/headers/body, challenge
+identifiers, and both encoded and decoded metadata. `Set-Cookie` is redacted.
+
 See [API_README.md](API_README.md) for endpoints and usage examples.
 
 ## Security
