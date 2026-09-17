@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+*.har
+
+# Runtime state may contain Roblox sessions, cookies and browser storage.
+api_jobs/
+ram_launch_logs/
+chromium_profile/
+
+# Local configuration can contain an API key and proxy credentials.
+api_config.json
+
+# Editor and OS files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

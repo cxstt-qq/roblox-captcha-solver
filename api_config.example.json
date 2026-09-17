@@ -1,0 +1,14 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "api_key": "",
+  "place_id": 920587237,
+  "job_timeout_seconds": 1200,
+  "captcha_max_attempts": 3,
+  "probe_invalidated_in_roblox": false,
+  "max_accounts": 10000,
+  "chromium_proxy_server": "",
+  "chromium_proxy_username": "",
+  "chromium_proxy_password": "",
+  "chromium_proxy_bypass": "localhost,127.0.0.1"
+}
