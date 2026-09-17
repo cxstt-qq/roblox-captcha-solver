@@ -42,6 +42,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "place_id": 2809202155,
     "job_timeout_seconds": 1200,
     "captcha_max_attempts": 3,
+    "captcha_solve_timeout_seconds": 180,
+    "captchav2_solve_timeout_seconds": 60,
     "probe_invalidated_in_roblox": False,
     "network_diagnostics": True,
     "keep_chromium_profiles": False,
@@ -257,6 +259,12 @@ def run_account(job: Job, line: str, index: int) -> str:
             "RAM_LAUNCH_CONSOLE_VERBOSE": "0",
             "RAM_LAUNCH_ALLOW_ENTER": "0",
             "RAM_LAUNCH_CAPTCHA_MAX_ATTEMPTS": str(CONFIG["captcha_max_attempts"]),
+            "RAM_LAUNCH_CAPTCHA_SOLVE_TIMEOUT_SECONDS": str(
+                CONFIG.get("captcha_solve_timeout_seconds", 180)
+            ),
+            "RAM_LAUNCH_CAPTCHAV2_SOLVE_TIMEOUT_SECONDS": str(
+                CONFIG.get("captchav2_solve_timeout_seconds", 60)
+            ),
             "RAM_LAUNCH_PROBE_INVALIDATED_IN_ROBLOX": str(
                 bool(CONFIG.get("probe_invalidated_in_roblox", False))
             ),

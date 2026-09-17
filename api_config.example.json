@@ -5,6 +5,8 @@
   "place_id": 920587237,
   "job_timeout_seconds": 1200,
   "captcha_max_attempts": 3,
+  "captcha_solve_timeout_seconds": 180,
+  "captchav2_solve_timeout_seconds": 60,
   "probe_invalidated_in_roblox": false,
   "network_diagnostics": true,
   "keep_chromium_profiles": false,

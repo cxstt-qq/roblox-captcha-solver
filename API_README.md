@@ -48,6 +48,8 @@ attempt and never reuse rejected challenge metadata. Relevant configuration:
 
 ```json
 "probe_invalidated_in_roblox": false,
+"captcha_solve_timeout_seconds": 180,
+"captchav2_solve_timeout_seconds": 60,
 "network_diagnostics": true,
 "keep_chromium_profiles": false,
 "chromium_profile_max_age_hours": 24,

@@ -65,6 +65,12 @@ CAPTCHA_MAX_ATTEMPTS = 3
 CAPTCHA_MAX_ATTEMPTS = int(
     os.getenv("RAM_LAUNCH_CAPTCHA_MAX_ATTEMPTS", str(CAPTCHA_MAX_ATTEMPTS))
 )
+CAPTCHA_SOLVE_TIMEOUT_SECONDS = float(
+    os.getenv("RAM_LAUNCH_CAPTCHA_SOLVE_TIMEOUT_SECONDS", "180")
+)
+CAPTCHAV2_SOLVE_TIMEOUT_SECONDS = float(
+    os.getenv("RAM_LAUNCH_CAPTCHAV2_SOLVE_TIMEOUT_SECONDS", "60")
+)
 # Диагностический режим: если веб-страница прислала challengeInvalidated,
 # всё равно один раз запускаем Roblox и считаем окончательным только client log.
 PROBE_INVALIDATED_IN_ROBLOX = os.getenv(
@@ -203,6 +209,8 @@ class TraceLogger:
             "STEP CAPTCHA_MANUAL_WAIT ",
             "STEP CAPTCHA_SOLVE_TIMEOUT",
             "STEP CAPTCHA_BUTTON_POLL_INTERRUPTED ",
+            "CAPTCHA_HOLD_DOWN ",
+            "CAPTCHA_HOLD_UP ",
             "CAPTCHA_CONTINUE_RESPONSE ",
             "CAPTCHA_CONTINUE_REQUEST_FAILED ",
             "CAPTCHA_SOLVE_CONFIRMED ",
@@ -1232,9 +1240,18 @@ def capture_captcha_with_playwright(
         )
 
         autosolve_attempted = False
-        solve_deadline = time.monotonic() + 180.0
+        challenge_type_normalized = active_preflight.challenge_type.strip().lower()
+        solve_timeout_seconds = (
+            CAPTCHAV2_SOLVE_TIMEOUT_SECONDS
+            if challenge_type_normalized == "captchav2"
+            else CAPTCHA_SOLVE_TIMEOUT_SECONDS
+        )
+        solve_started_at = time.monotonic()
+        solve_deadline = solve_started_at + max(1.0, solve_timeout_seconds)
         LOG.write(
-            f"STEP CAPTCHA_SOLVE_DEADLINE set_at=+180s"
+            "STEP CAPTCHA_SOLVE_DEADLINE "
+            f"challenge_type={active_preflight.challenge_type or '<none>'} "
+            f"timeout={solve_timeout_seconds:.1f}s"
         )
 
         while (
@@ -1251,7 +1268,12 @@ def capture_captcha_with_playwright(
                     break
 
                 if time.monotonic() > solve_deadline:
-                    LOG.write("STEP CAPTCHA_SOLVE_TIMEOUT after 180s")
+                    LOG.write(
+                        "STEP CAPTCHA_SOLVE_TIMEOUT "
+                        f"challenge_type={active_preflight.challenge_type or '<none>'} "
+                        f"elapsed={time.monotonic() - solve_started_at:.2f}s "
+                        f"limit={solve_timeout_seconds:.1f}s"
+                    )
                     break
 
                 page.wait_for_timeout(100)
@@ -1380,16 +1402,32 @@ def capture_captcha_with_playwright(
                             hold_time = min(random.uniform(15.0, 20.0), remaining)
                             LOG.write(f"STEP CAPTCHA_HOLD_START duration={hold_time:.2f}s")
                             page.mouse.move(x, y)
+                            down_wall_time = datetime.now(timezone.utc).isoformat()
                             page.mouse.down()
                             press_started = time.monotonic()
-                            LOG.write(f"STEP CAPTCHA_MOUSE_DOWN attempt={hold_attempt}")
+                            LOG.write(
+                                "CAPTCHA_HOLD_DOWN "
+                                f"attempt={hold_attempt} "
+                                f"challenge_type={active_preflight.challenge_type or '<none>'} "
+                                f"challenge_id={active_preflight.challenge_id} "
+                                f"frame_url={target_frame.url!r} "
+                                f"x={x:.2f} y={y:.2f} coordinate_space=page_viewport "
+                                f"box_x={box['x']:.2f} box_y={box['y']:.2f} "
+                                f"box_w={box['width']:.2f} box_h={box['height']:.2f} "
+                                f"planned_hold={hold_time:.2f}s utc={down_wall_time}"
+                            )
                             try:
                                 page.wait_for_timeout(int(hold_time * 1000))
                             finally:
                                 page.mouse.up()
+                                held_seconds = time.monotonic() - press_started
+                                up_wall_time = datetime.now(timezone.utc).isoformat()
                                 LOG.write(
-                                    f"STEP CAPTCHA_MOUSE_UP held="
-                                    f"{(time.monotonic() - press_started):.2f}s"
+                                    "CAPTCHA_HOLD_UP "
+                                    f"attempt={hold_attempt} "
+                                    f"x={x:.2f} y={y:.2f} "
+                                    f"planned_hold={hold_time:.2f}s "
+                                    f"actual_hold={held_seconds:.2f}s utc={up_wall_time}"
                                 )
 
                             page.wait_for_timeout(2000)
