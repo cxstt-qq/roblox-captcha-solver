@@ -43,6 +43,31 @@ An extension that explicitly changes Chrome proxy settings may override it.
 challenge reports `challengeInvalidated`, the tool launches Roblox once and
 uses the new Roblox client log as the final captcha verdict.
 
+For 403 diagnostics the current defaults use a fresh Chromium profile for every
+attempt and never reuse rejected challenge metadata. Relevant configuration:
+
+```json
+"probe_invalidated_in_roblox": false,
+"network_diagnostics": true,
+"keep_chromium_profiles": false,
+"chromium_profile_max_age_hours": 24,
+"chromium_executable_path": "",
+"chromium_locale": "en-US",
+"chromium_timezone_id": "",
+"extension_enabled": true,
+"network_identity_url": "https://www.cloudflare.com/cdn-cgi/trace"
+```
+
+When `chromium_executable_path` is empty, Playwright's bundled Chromium is used.
+Set it only to a Chromium-compatible executable; `Roblox Account Manager.exe`
+itself is not a Chromium executable. Python requests and Chromium use the same
+configured proxy. The log compares their public IP with the system HTTP route;
+the Roblox player route is system-managed and can only be inferred.
+
+With `network_diagnostics=true`, each attempt writes a separate HAR beside its
+solver log. HAR files can contain session cookies and challenge tokens; do not
+share or commit them.
+
 ## Start a check
 
 ```powershell

@@ -7,6 +7,7 @@ __pycache__/
 api_jobs/
 ram_launch_logs/
 chromium_profile/
+chromium_profiles/
 
 # Local configuration can contain an API key and proxy credentials.
 api_config.json
@@ -16,4 +17,3 @@ api_config.json
 .vscode/
 .DS_Store
 Thumbs.db
-

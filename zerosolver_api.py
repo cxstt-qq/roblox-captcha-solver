@@ -42,7 +42,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "place_id": 2809202155,
     "job_timeout_seconds": 1200,
     "captcha_max_attempts": 3,
-    "probe_invalidated_in_roblox": True,
+    "probe_invalidated_in_roblox": False,
+    "network_diagnostics": True,
+    "keep_chromium_profiles": False,
+    "chromium_profile_max_age_hours": 24,
+    "chromium_executable_path": "",
+    "chromium_locale": "en-US",
+    "chromium_timezone_id": "",
+    "extension_enabled": True,
+    "network_identity_url": "https://www.cloudflare.com/cdn-cgi/trace",
     "max_accounts": 10000,
     "chromium_proxy_server": "",
     "chromium_proxy_username": "",
@@ -251,6 +259,30 @@ def run_account(job: Job, line: str, index: int) -> str:
             "RAM_LAUNCH_CAPTCHA_MAX_ATTEMPTS": str(CONFIG["captcha_max_attempts"]),
             "RAM_LAUNCH_PROBE_INVALIDATED_IN_ROBLOX": str(
                 bool(CONFIG.get("probe_invalidated_in_roblox", False))
+            ),
+            "RAM_LAUNCH_NETWORK_DIAGNOSTICS": str(
+                bool(CONFIG.get("network_diagnostics", True))
+            ),
+            "RAM_LAUNCH_KEEP_CHROMIUM_PROFILES": str(
+                bool(CONFIG.get("keep_chromium_profiles", False))
+            ),
+            "RAM_LAUNCH_PROFILE_MAX_AGE_HOURS": str(
+                int(CONFIG.get("chromium_profile_max_age_hours", 24))
+            ),
+            "RAM_LAUNCH_CHROMIUM_EXECUTABLE_PATH": str(
+                CONFIG.get("chromium_executable_path") or ""
+            ),
+            "RAM_LAUNCH_CHROMIUM_LOCALE": str(
+                CONFIG.get("chromium_locale") or "en-US"
+            ),
+            "RAM_LAUNCH_CHROMIUM_TIMEZONE_ID": str(
+                CONFIG.get("chromium_timezone_id") or ""
+            ),
+            "RAM_LAUNCH_EXTENSION_ENABLED": str(
+                bool(CONFIG.get("extension_enabled", True))
+            ),
+            "RAM_LAUNCH_NETWORK_IDENTITY_URL": str(
+                CONFIG.get("network_identity_url") or ""
             ),
             "RAM_LAUNCH_CHROMIUM_PROXY_SERVER": str(
                 CONFIG.get("chromium_proxy_server") or ""

@@ -7,10 +7,12 @@ Windows only: итоговая ссылка открывается через з
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -53,9 +55,11 @@ WAIT_FOR_INPUT_ON_PREFLIGHT_CAPTCHA = os.getenv(
 # полный HAR + важные события страницы. Решение капчи остаётся ручным.
 CAPTCHA_PLAYWRIGHT_CAPTURE = True
 CAPTCHA_CAPTURE_SETTLE_SECONDS = 5
-# HAR и сетевые callbacks полезны для исследования, но могут менять тайминги
-# чувствительной challenge-страницы. В рабочем ручном тесте оставляем выключенными.
-CAPTCHA_NETWORK_DIAGNOSTICS = False
+# HAR и сетевые callbacks включены для текущей диагностики 403. Их можно
+# отключить через RAM_LAUNCH_NETWORK_DIAGNOSTICS=0 после завершения исследования.
+CAPTCHA_NETWORK_DIAGNOSTICS = os.getenv(
+    "RAM_LAUNCH_NETWORK_DIAGNOSTICS", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 # Сколько раз создавать новый challenge после отклонённого решения.
 CAPTCHA_MAX_ATTEMPTS = 3
 CAPTCHA_MAX_ATTEMPTS = int(
@@ -64,7 +68,7 @@ CAPTCHA_MAX_ATTEMPTS = int(
 # Диагностический режим: если веб-страница прислала challengeInvalidated,
 # всё равно один раз запускаем Roblox и считаем окончательным только client log.
 PROBE_INVALIDATED_IN_ROBLOX = os.getenv(
-    "RAM_LAUNCH_PROBE_INVALIDATED_IN_ROBLOX", "1"
+    "RAM_LAUNCH_PROBE_INVALIDATED_IN_ROBLOX", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 # True остановит запуск, если повторная проверка после Enter всё ещё видит капчу.
 # False всё равно попробует запустить Roblox — удобно для диагностики.
@@ -90,13 +94,36 @@ LOG_DIR = SCRIPT_DIR / "ram_launch_logs"
 # Распакованное Chromium-расширение: extension/manifest.json.
 # Если manifest.json отсутствует, Chromium запускается без расширения.
 EXTENSION_DIR = SCRIPT_DIR / "extension"
-CHROMIUM_PROFILE_DIR = SCRIPT_DIR / "chromium_profile"
+# Every capture attempt receives a new profile. Reusing one persistent profile
+# across unrelated Roblox cookies leaves account-bound localStorage, service
+# workers and auxiliary cookies behind and can invalidate challenge redemption.
+CHROMIUM_PROFILE_ROOT = SCRIPT_DIR / "chromium_profiles"
+KEEP_CHROMIUM_PROFILES = os.getenv(
+    "RAM_LAUNCH_KEEP_CHROMIUM_PROFILES", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+CHROMIUM_PROFILE_MAX_AGE_HOURS = int(
+    os.getenv("RAM_LAUNCH_PROFILE_MAX_AGE_HOURS", "24")
+)
+CHROMIUM_EXECUTABLE_PATH = os.getenv(
+    "RAM_LAUNCH_CHROMIUM_EXECUTABLE_PATH", ""
+).strip()
+CHROMIUM_LOCALE = os.getenv("RAM_LAUNCH_CHROMIUM_LOCALE", "en-US").strip()
+CHROMIUM_TIMEZONE_ID = os.getenv(
+    "RAM_LAUNCH_CHROMIUM_TIMEZONE_ID", ""
+).strip()
+CHROMIUM_EXTENSION_ENABLED = os.getenv(
+    "RAM_LAUNCH_EXTENSION_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 # Прокси применяется ко всему persistent Chromium context, включая запросы
 # страниц, service worker и загруженного расширения.
 CHROMIUM_PROXY_SERVER = os.getenv("RAM_LAUNCH_CHROMIUM_PROXY_SERVER", "").strip()
 CHROMIUM_PROXY_USERNAME = os.getenv("RAM_LAUNCH_CHROMIUM_PROXY_USERNAME", "").strip()
 CHROMIUM_PROXY_PASSWORD = os.getenv("RAM_LAUNCH_CHROMIUM_PROXY_PASSWORD", "").strip()
 CHROMIUM_PROXY_BYPASS = os.getenv("RAM_LAUNCH_CHROMIUM_PROXY_BYPASS", "").strip()
+NETWORK_IDENTITY_URL = os.getenv(
+    "RAM_LAUNCH_NETWORK_IDENTITY_URL",
+    "https://www.cloudflare.com/cdn-cgi/trace",
+).strip()
 # -----------------------------------------------------------------------------
 
 
@@ -183,6 +210,11 @@ class TraceLogger:
             "CAPTCHA_WAIT_RESULT ",
             "CAPTCHA_CAPTURE_RESULT ",
             "CAPTCHA_ATTEMPT_RESULT ",
+            "CAPTCHA_FRESH_CHALLENGE_FAILED ",
+            "CHROMIUM_PROFILE ",
+            "NETWORK_IDENTITY_COMPARE ",
+            "NETWORK_ROUTE_MISMATCH ",
+            "ROBLOX_BROWSER_WARMUP ",
             "GAMEJOIN_BROWSER_REPLAY_RESULT ",
             "GAMEJOIN_CHALLENGE_REPLAY_RESULT ",
             "GAMEJOIN_REPLAY_BYPASSED ",
@@ -202,6 +234,167 @@ class TraceLogger:
 
 
 LOG = TraceLogger()
+
+
+def value_fingerprint(value: object) -> str:
+    rendered = str(value or "")
+    return f"sha256:{hashlib.sha256(rendered.encode('utf-8')).hexdigest()[:12]} len={len(rendered)}"
+
+
+def sanitized_headers(headers) -> dict[str, str]:
+    result: dict[str, str] = {}
+    sensitive = {
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "x-csrf-token",
+        "rbx-authentication-ticket",
+        "rblx-challenge-metadata",
+    }
+    for name, value in headers.items():
+        rendered = str(value)
+        if str(name).lower() in sensitive:
+            result[str(name)] = f"<{value_fingerprint(rendered)}>"
+        else:
+            result[str(name)] = rendered
+    return result
+
+
+def cookie_snapshot(cookies: list[dict[str, object]]) -> list[dict[str, object]]:
+    snapshot: list[dict[str, object]] = []
+    for item in sorted(
+        cookies,
+        key=lambda current: (
+            str(current.get("domain") or ""),
+            str(current.get("name") or ""),
+        ),
+    ):
+        snapshot.append(
+            {
+                "name": str(item.get("name") or ""),
+                "domain": str(item.get("domain") or ""),
+                "path": str(item.get("path") or ""),
+                "secure": bool(item.get("secure")),
+                "httpOnly": bool(item.get("httpOnly")),
+                "sameSite": str(item.get("sameSite") or ""),
+                "expires": item.get("expires"),
+                "value": value_fingerprint(item.get("value") or ""),
+            }
+        )
+    return snapshot
+
+
+def log_cookie_snapshot(label: str, cookies: list[dict[str, object]]) -> None:
+    LOG.write(
+        f"COOKIE_SNAPSHOT label={label} count={len(cookies)}\n"
+        + json.dumps(cookie_snapshot(cookies), ensure_ascii=False, indent=2)
+    )
+
+
+def proxy_url_for_requests() -> str:
+    if not CHROMIUM_PROXY_SERVER:
+        return ""
+    parsed = urlsplit(CHROMIUM_PROXY_SERVER)
+    if not parsed.scheme:
+        parsed = urlsplit("http://" + CHROMIUM_PROXY_SERVER)
+    if not CHROMIUM_PROXY_USERNAME or "@" in parsed.netloc:
+        return urlunsplit(parsed)
+    credentials = quote(CHROMIUM_PROXY_USERNAME, safe="")
+    if CHROMIUM_PROXY_PASSWORD:
+        credentials += ":" + quote(CHROMIUM_PROXY_PASSWORD, safe="")
+    return urlunsplit(
+        (parsed.scheme, f"{credentials}@{parsed.netloc}", parsed.path, parsed.query, parsed.fragment)
+    )
+
+
+def configure_requests_network(session: requests.Session) -> None:
+    proxy_url = proxy_url_for_requests()
+    if proxy_url:
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+    LOG.write(
+        "NETWORK_ROUTE_CONFIG "
+        f"python_proxy={str(bool(proxy_url)).lower()} "
+        f"chromium_proxy={str(bool(CHROMIUM_PROXY_SERVER)).lower()} "
+        "roblox_player_proxy=system_managed"
+    )
+
+
+def parse_trace_ip(text: str) -> str:
+    for line in str(text or "").splitlines():
+        if line.startswith("ip="):
+            return line.partition("=")[2].strip()
+    return ""
+
+
+def log_python_network_identity(session: requests.Session) -> str:
+    if not NETWORK_IDENTITY_URL:
+        return ""
+    try:
+        response = session.get(NETWORK_IDENTITY_URL, timeout=15)
+        ip = parse_trace_ip(response.text)
+        LOG.write(
+            "NETWORK_IDENTITY source=python "
+            f"status={response.status_code} ip={ip or '<unknown>'}"
+        )
+        return ip
+    except requests.RequestException as exc:
+        LOG.write(
+            "NETWORK_IDENTITY source=python status=error "
+            f"error={type(exc).__name__}:{exc}"
+        )
+        return ""
+
+
+def log_system_network_identity() -> str:
+    if not NETWORK_IDENTITY_URL:
+        return ""
+    try:
+        response = requests.get(NETWORK_IDENTITY_URL, timeout=15)
+        ip = parse_trace_ip(response.text)
+        LOG.write(
+            "NETWORK_IDENTITY source=system_http "
+            f"status={response.status_code} ip={ip or '<unknown>'}"
+        )
+        return ip
+    except requests.RequestException as exc:
+        LOG.write(
+            "NETWORK_IDENTITY source=system_http status=error "
+            f"error={type(exc).__name__}:{exc}"
+        )
+        return ""
+
+
+def create_isolated_profile() -> Path:
+    CHROMIUM_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    profile = CHROMIUM_PROFILE_ROOT / f"attempt_{stamp}_{uuid.uuid4().hex[:8]}"
+    profile.mkdir(parents=True, exist_ok=False)
+    LOG.write(f"CHROMIUM_PROFILE mode=isolated path={profile}")
+    return profile
+
+
+def dispose_profile(profile: Path) -> None:
+    if KEEP_CHROMIUM_PROFILES:
+        LOG.write(f"CHROMIUM_PROFILE_RETAINED path={profile}")
+        return
+    try:
+        shutil.rmtree(profile)
+        LOG.write(f"CHROMIUM_PROFILE_REMOVED path={profile}")
+    except OSError as exc:
+        LOG.write(f"CHROMIUM_PROFILE_REMOVE_ERROR path={profile} error={exc}")
+
+
+def cleanup_old_profiles() -> None:
+    if not CHROMIUM_PROFILE_ROOT.exists():
+        return
+    cutoff = time.time() - max(1, CHROMIUM_PROFILE_MAX_AGE_HOURS) * 3600
+    for profile in CHROMIUM_PROFILE_ROOT.glob("attempt_*"):
+        try:
+            if profile.is_dir() and profile.stat().st_mtime < cutoff:
+                shutil.rmtree(profile)
+                LOG.write(f"CHROMIUM_PROFILE_CLEANUP path={profile} reason=expired")
+        except OSError as exc:
+            LOG.write(f"CHROMIUM_PROFILE_CLEANUP_ERROR path={profile} error={exc}")
 
 
 def all_headers(headers) -> dict[str, str]:
@@ -228,7 +421,10 @@ def request_with_trace(session: requests.Session, method: str, url: str, **kwarg
 
     LOG.write("=" * 78)
     LOG.write(f"REQUEST {prepared.method} {prepared.url}")
-    LOG.write("Request headers: " + json.dumps(all_headers(prepared.headers), ensure_ascii=False))
+    LOG.write(
+        "Request headers: "
+        + json.dumps(sanitized_headers(prepared.headers), ensure_ascii=False)
+    )
     LOG.write("Request body:\n" + pretty_body(prepared.body))
 
     response = session.send(
@@ -238,7 +434,10 @@ def request_with_trace(session: requests.Session, method: str, url: str, **kwarg
     )
 
     LOG.write(f"RESPONSE HTTP {response.status_code} {response.reason} elapsed={response.elapsed.total_seconds():.3f}s")
-    LOG.write("Response headers: " + json.dumps(all_headers(response.headers), ensure_ascii=False))
+    LOG.write(
+        "Response headers: "
+        + json.dumps(sanitized_headers(response.headers), ensure_ascii=False)
+    )
     LOG.write("Response body:\n" + pretty_body(response.text))
     return response
 
@@ -256,7 +455,7 @@ def get_csrf_token(session: requests.Session, label: str) -> str:
         raise RuntimeError(
             f"CSRF token missing: HTTP {response.status_code}; response={response.text[:1000]!r}"
         )
-    LOG.write(f"X-CSRF received: {token}")
+    LOG.write(f"X-CSRF received: {value_fingerprint(token)}")
     return token
 
 
@@ -280,7 +479,7 @@ def get_authentication_ticket(session: requests.Session, csrf_token: str) -> str
             f"clientAssertion missing: HTTP {assertion_response.status_code}; "
             f"response={assertion_response.text[:2000]!r}"
         )
-    LOG.write(f"Client assertion received: {client_assertion}")
+    LOG.write(f"Client assertion received: {value_fingerprint(client_assertion)}")
 
     LOG.write("STEP AUTH_TICKET: requesting rbx-authentication-ticket")
     response = request_with_trace(
@@ -299,7 +498,7 @@ def get_authentication_ticket(session: requests.Session, csrf_token: str) -> str
             f"Authentication ticket missing: HTTP {response.status_code}; "
             f"response={response.text[:2000]!r}"
         )
-    LOG.write(f"Authentication ticket received: {ticket}")
+    LOG.write(f"Authentication ticket received: {value_fingerprint(ticket)}")
     return ticket
 
 
@@ -406,6 +605,8 @@ def capture_captcha_with_playwright(
     captcha_url: str,
     cookie: str,
     preflight: GameJoinPreflight,
+    python_ip: str = "",
+    system_ip: str = "",
 ) -> CaptchaCompletion | None:
     """Открывает captcha по браузерной схеме RAM и пишет диагностику в HAR."""
     try:
@@ -418,7 +619,9 @@ def capture_captcha_with_playwright(
         input("Реши капчу вручную и нажми Enter для продолжения: ")
         return None
 
-    har_path = LOG.path.with_name(f"{LOG.path.stem}_captcha.har")
+    capture_id = uuid.uuid4().hex[:10]
+    profile_dir = create_isolated_profile()
+    har_path = LOG.path.with_name(f"{LOG.path.stem}_captcha_{capture_id}.har")
     LOG.write(
         "CAPTCHA_CAPTURE_START har="
         + (str(har_path) if CAPTCHA_NETWORK_DIAGNOSTICS else "disabled")
@@ -442,7 +645,9 @@ def capture_captcha_with_playwright(
             "--window-size=880,740",
         ]
         extension_manifest = EXTENSION_DIR / "manifest.json"
-        extension_enabled = extension_manifest.is_file()
+        extension_enabled = (
+            CHROMIUM_EXTENSION_ENABLED and extension_manifest.is_file()
+        )
         if extension_enabled:
             extension_path = str(EXTENSION_DIR.resolve())
             launch_args.extend(
@@ -456,14 +661,16 @@ def capture_captcha_with_playwright(
             f"enabled={str(extension_enabled).lower()} "
             f"path={EXTENSION_DIR} "
             f"manifest_exists={str(extension_manifest.is_file()).lower()} "
-            f"config_exists={str(any((EXTENSION_DIR / name).is_file() for name in ('config.json', 'configs.json'))).lower()}"
+            f"config_exists={str(any((EXTENSION_DIR / name).is_file() for name in ('config.js', 'config.json', 'configs.json'))).lower()}"
         )
-        CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         context_options = dict(
             viewport=None,
             ignore_https_errors=True,
             user_agent=RAM_BROWSER_USER_AGENT,
+            locale=CHROMIUM_LOCALE or "en-US",
         )
+        if CHROMIUM_TIMEZONE_ID:
+            context_options["timezone_id"] = CHROMIUM_TIMEZONE_ID
         if CHROMIUM_PROXY_SERVER:
             proxy_options = {"server": CHROMIUM_PROXY_SERVER}
             if CHROMIUM_PROXY_USERNAME:
@@ -487,10 +694,14 @@ def capture_captcha_with_playwright(
                 record_har_mode="full",
                 record_har_content="embed",
             )
+        launch_options: dict[str, object] = {}
+        if CHROMIUM_EXECUTABLE_PATH:
+            launch_options["executable_path"] = CHROMIUM_EXECUTABLE_PATH
         context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(CHROMIUM_PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=False,
             args=launch_args,
+            **launch_options,
             **context_options,
         )
         context.add_cookies(
@@ -509,17 +720,43 @@ def capture_captcha_with_playwright(
         Stealth(
             navigator_user_agent_override=RAM_BROWSER_USER_AGENT,
         ).apply_stealth_sync(context)
+        try:
+            browser_version = context.browser.version if context.browser else "<unknown>"
+        except PlaywrightError:
+            browser_version = "<unavailable>"
         LOG.write(
             "CAPTCHA_BROWSER_CONFIG engine=playwright_chromium headless=false "
             "viewport=none disable_web_security=true ignore_https_errors=true "
             "stealth=true user_agent=chrome_111 referer=https://google.com/ "
-            f"proxy={str(bool(CHROMIUM_PROXY_SERVER)).lower()}"
+            f"proxy={str(bool(CHROMIUM_PROXY_SERVER)).lower()} "
+            f"profile=isolated browser_version={browser_version!r} "
+            f"executable={CHROMIUM_EXECUTABLE_PATH or '<playwright-bundled>'} "
+            f"locale={CHROMIUM_LOCALE or '<system>'} "
+            f"timezone={CHROMIUM_TIMEZONE_ID or '<system>'}"
         )
 
         def bind_page(page) -> None:
             LOG.write(f"CAPTCHA_PAGE_OPENED url={page.url}")
 
             def on_request(request) -> None:
+                if (
+                    request.url.rstrip("/").endswith("/challenge/v1/continue")
+                    or request.url.rstrip("/").endswith("/v1/join-game")
+                ):
+                    try:
+                        LOG.write(
+                            "BROWSER_REQUEST_HEADERS "
+                            f"method={request.method} url={request.url} "
+                            + json.dumps(
+                                sanitized_headers(request.all_headers()),
+                                ensure_ascii=False,
+                            )
+                        )
+                    except PlaywrightError as exc:
+                        LOG.write(
+                            "BROWSER_REQUEST_HEADERS_ERROR "
+                            f"url={request.url} error={exc}"
+                        )
                 if "/challenge/" in request.url:
                     LOG.write(f"STEP CHALLENGE_REQ {request.method} {request.url}")
                     if request.url.rstrip("/").endswith("/challenge/v1/continue"):
@@ -595,6 +832,24 @@ def capture_captcha_with_playwright(
                     )
 
             def on_response(response) -> None:
+                if (
+                    response.url.rstrip("/").endswith("/challenge/v1/continue")
+                    or response.url.rstrip("/").endswith("/v1/join-game")
+                ):
+                    try:
+                        LOG.write(
+                            "BROWSER_RESPONSE_HEADERS "
+                            f"status={response.status} url={response.url} "
+                            + json.dumps(
+                                sanitized_headers(response.all_headers()),
+                                ensure_ascii=False,
+                            )
+                        )
+                    except PlaywrightError as exc:
+                        LOG.write(
+                            "BROWSER_RESPONSE_HEADERS_ERROR "
+                            f"url={response.url} error={exc}"
+                        )
                 if "/challenge/" in response.url:
                     LOG.write(f"STEP CHALLENGE_RESP {response.status} {response.url}")
 
@@ -733,6 +988,50 @@ def capture_captcha_with_playwright(
         if not CAPTCHA_NETWORK_DIAGNOSTICS:
             LOG.write("CAPTCHA_DIAGNOSTICS mode=minimal_continue_capture")
 
+        try:
+            initial_browser_cookies = context.cookies(
+                ["https://www.roblox.com", "https://gamejoin.roblox.com"]
+            )
+            log_cookie_snapshot("browser_after_roblosecurity_seed", initial_browser_cookies)
+        except PlaywrightError as exc:
+            LOG.write(f"COOKIE_SNAPSHOT_ERROR label=browser_seed error={exc}")
+
+        browser_ip = ""
+        if NETWORK_IDENTITY_URL:
+            try:
+                identity_response = context.request.get(
+                    NETWORK_IDENTITY_URL,
+                    timeout=15_000,
+                )
+                browser_ip = parse_trace_ip(identity_response.text())
+                LOG.write(
+                    "NETWORK_IDENTITY source=chromium_context "
+                    f"status={identity_response.status} "
+                    f"ip={browser_ip or '<unknown>'}"
+                )
+                if python_ip and browser_ip:
+                    system_matches = not system_ip or system_ip == browser_ip
+                    LOG.write(
+                        "NETWORK_IDENTITY_COMPARE "
+                        f"python_ip={python_ip} chromium_ip={browser_ip} "
+                        f"match={str(python_ip == browser_ip).lower()} "
+                        f"system_ip={system_ip or '<unknown>'} "
+                        f"system_match={str(system_matches).lower()} "
+                        "roblox_player_route=system_assumed_not_proven"
+                    )
+                    if python_ip != browser_ip or not system_matches:
+                        LOG.write(
+                            "NETWORK_ROUTE_MISMATCH "
+                            f"python={python_ip} chromium={browser_ip} "
+                            f"system={system_ip or '<unknown>'} "
+                            "warning=challenge_and_player_may_use_different_public_ips"
+                        )
+            except PlaywrightError as exc:
+                LOG.write(
+                    "NETWORK_IDENTITY source=chromium_context status=error "
+                    f"error={type(exc).__name__}:{exc}"
+                )
+
         # Challenge должен быть создан, решён и подтверждён одним и тем же
         # браузерным контекстом. Иначе GCS может принять /challenge/v1/continue,
         # но отвергнуть повтор исходного запроса как чужую сессию.
@@ -743,6 +1042,33 @@ def capture_captcha_with_playwright(
                 wait_until="domcontentloaded",
                 timeout=120_000,
             )
+            page.wait_for_timeout(1500)
+            warmup_result = page.evaluate(
+                """async () => {
+                    try {
+                        const response = await fetch(
+                            "https://users.roblox.com/v1/users/authenticated",
+                            {credentials: "include", headers: {"Accept": "application/json"}}
+                        );
+                        const text = await response.text();
+                        let username = "";
+                        try { username = JSON.parse(text).name || ""; } catch (_) {}
+                        return {status: response.status, username, text: text.slice(0, 300)};
+                    } catch (error) {
+                        return {status: 0, username: "", text: String(error)};
+                    }
+                }"""
+            )
+            LOG.write(
+                "ROBLOX_BROWSER_WARMUP "
+                f"status={warmup_result.get('status')} "
+                f"username={warmup_result.get('username') or '<none>'} "
+                f"body={warmup_result.get('text', '')[:300]!r}"
+            )
+            warmup_cookies = context.cookies(
+                ["https://www.roblox.com", "https://gamejoin.roblox.com"]
+            )
+            log_cookie_snapshot("browser_after_roblox_warmup", warmup_cookies)
             browser_attempt_id = str(uuid.uuid4())
             browser_request_body: dict[str, object] = {
                 "placeId": PLACE_ID,
@@ -811,16 +1137,51 @@ def capture_captcha_with_playwright(
                     "CAPTCHA_SOURCE browser_preflight "
                     f"challenge_id={active_preflight.challenge_id}"
                 )
+            elif browser_preflight.get("status") == 200:
+                browser_cookies = context.cookies(
+                    ["https://www.roblox.com", "https://gamejoin.roblox.com"]
+                )
+                log_cookie_snapshot("browser_preflight_already_clear", browser_cookies)
+                for browser_item in browser_cookies:
+                    if browser_item.get("name") == ".ROBLOSECURITY":
+                        browser_cookie = str(browser_item.get("value") or cookie)
+                        break
+                LOG.write(
+                    "CAPTCHA_CAPTURE_RESULT result=ALREADY_CLEAR "
+                    "source=fresh_browser_preflight"
+                )
+                context.close()
+                dispose_profile(profile_dir)
+                return CaptchaCompletion(
+                    challenge_id=preflight.challenge_id,
+                    challenge_type=preflight.challenge_type or "captcha",
+                    challenge_metadata="",
+                    browser_cookie=browser_cookie,
+                    browser_cookies=browser_cookies,
+                    browser_replay_accepted=True,
+                    replay_preflight=preflight,
+                )
             else:
                 LOG.write(
-                    "CAPTCHA_SOURCE python_preflight_fallback "
-                    "reason=browser_preflight_did_not_return_challenge"
+                    "CAPTCHA_FRESH_CHALLENGE_FAILED "
+                    f"status={browser_preflight.get('status')} "
+                    "action=discard_attempt no_old_challenge_reuse=true"
                 )
+                context.close()
+                dispose_profile(profile_dir)
+                return None
         except PlaywrightError as exc:
             LOG.write(
                 "GAMEJOIN_BROWSER_PREFLIGHT_ERROR "
-                f"error={type(exc).__name__}: {exc}; using_python_challenge=true"
+                f"error={type(exc).__name__}: {exc}; "
+                "action=discard_attempt no_old_challenge_reuse=true"
             )
+            try:
+                context.close()
+            except PlaywrightError:
+                pass
+            dispose_profile(profile_dir)
+            return None
         # Всё, что произошло при загрузке /home (например challenge типа chef),
         # не относится к игровой captcha. Начинаем детект с чистого состояния.
         continuation.clear()
@@ -1116,6 +1477,7 @@ def capture_captcha_with_playwright(
             browser_cookies = context.cookies(
                 ["https://www.roblox.com", "https://gamejoin.roblox.com"]
             )
+            log_cookie_snapshot("browser_after_challenge", browser_cookies)
             LOG.write(
                 "CAPTCHA_BROWSER_COOKIES_CAPTURED names="
                 + ",".join(sorted(str(item.get("name", "")) for item in browser_cookies))
@@ -1188,6 +1550,7 @@ def capture_captcha_with_playwright(
                 browser_cookies = context.cookies(
                     ["https://www.roblox.com", "https://gamejoin.roblox.com"]
                 )
+                log_cookie_snapshot("browser_after_gamejoin_replay", browser_cookies)
             except PlaywrightError as exc:
                 LOG.write(
                     "GAMEJOIN_BROWSER_REPLAY_ERROR "
@@ -1199,6 +1562,8 @@ def capture_captcha_with_playwright(
         except PlaywrightError as exc:
             if "closed" not in str(exc).lower():
                 raise
+
+    dispose_profile(profile_dir)
 
     LOG.write(
         "CAPTCHA_CAPTURE_FINISHED har="
@@ -1572,7 +1937,7 @@ def main() -> int:
 
     LOG.write(f"Log file: {LOG.path}")
     LOG.write(f"Config: place_id={PLACE_ID} job_id={JOB_ID or '<empty>'}")
-    LOG.write(f"Cookie: {cookie}")
+    LOG.write(f"Cookie: {value_fingerprint(cookie)}")
     LOG.write(f"roblox-player protocol handler: {get_protocol_handler()}")
 
     log_directories = discover_log_directories()
@@ -1583,7 +1948,11 @@ def main() -> int:
         "Accept": "application/json, text/plain, */*",
         "User-Agent": USER_AGENT,
     })
+    configure_requests_network(session)
     session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com", path="/")
+    cleanup_old_profiles()
+    system_ip = log_system_network_identity()
+    python_ip = log_python_network_identity(session)
 
     try:
         if GAMEJOIN_PREFLIGHT:
@@ -1598,7 +1967,11 @@ def main() -> int:
                     completion = None
                     if CAPTCHA_PLAYWRIGHT_CAPTURE and preflight.captcha_url:
                         completion = capture_captcha_with_playwright(
-                            preflight.captcha_url, cookie, preflight
+                            preflight.captcha_url,
+                            cookie,
+                            preflight,
+                            python_ip=python_ip,
+                            system_ip=system_ip,
                         )
                     elif WAIT_FOR_INPUT_ON_PREFLIGHT_CAPTCHA:
                         LOG.write(
@@ -1669,7 +2042,10 @@ def main() -> int:
                         f"attempt={captcha_attempt} result=REJECTED"
                     )
                     if captcha_attempt < CAPTCHA_MAX_ATTEMPTS:
-                        LOG.write("CAPTCHA_RETRY creating_new_challenge=true")
+                        LOG.write(
+                            "CAPTCHA_RETRY previous_challenge_discarded=true "
+                            "creating_new_profile=true creating_new_challenge=true"
+                        )
 
                 if not replay_accepted and STOP_ON_PREFLIGHT_CAPTCHA:
                     LOG.write(
