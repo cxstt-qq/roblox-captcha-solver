@@ -15,6 +15,10 @@ python zerosolver_api.py
 
 On Windows, `start_api.cmd` can be used after dependencies are installed.
 
+In the default Playwright mode, Chromium owns the complete gamejoin challenge
+flow: initial `/v1/join-game`, challenge completion, and replay. The Python
+requests session is not used for a second gamejoin request.
+
 Default base URL:
 
 ```text

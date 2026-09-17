@@ -1082,6 +1082,16 @@ def capture_captcha_with_playwright(
                 "placeId": PLACE_ID,
                 "gameJoinAttemptId": browser_attempt_id,
             }
+            browser_request_preflight = GameJoinPreflight(
+                captcha_detected=False,
+                captcha_url="",
+                challenge_id="",
+                challenge_type="",
+                encoded_metadata="",
+                attempt_id=browser_attempt_id,
+                request_body=browser_request_body,
+            )
+            active_preflight = browser_request_preflight
             LOG.write(
                 "STEP GAMEJOIN_BROWSER_PREFLIGHT "
                 f"attempt_id={browser_attempt_id}"
@@ -1161,13 +1171,13 @@ def capture_captcha_with_playwright(
                 context.close()
                 dispose_profile(profile_dir)
                 return CaptchaCompletion(
-                    challenge_id=preflight.challenge_id,
-                    challenge_type=preflight.challenge_type or "captcha",
+                    challenge_id="",
+                    challenge_type="",
                     challenge_metadata="",
                     browser_cookie=browser_cookie,
                     browser_cookies=browser_cookies,
                     browser_replay_accepted=True,
-                    replay_preflight=preflight,
+                    replay_preflight=browser_request_preflight,
                 )
             else:
                 LOG.write(
@@ -1994,8 +2004,33 @@ def main() -> int:
 
     try:
         if GAMEJOIN_PREFLIGHT:
-            preflight = preflight_gamejoin(session)
-            if preflight.captcha_detected:
+            browser_only_gamejoin = CAPTCHA_PLAYWRIGHT_CAPTURE
+            if browser_only_gamejoin:
+                # В Playwright-режиме Chromium является единственным владельцем
+                # всего gamejoin challenge: первый POST, решение и replay.
+                # Пустой объект нужен только для совместимости сигнатуры; внутри
+                # capture_captcha_with_playwright он заменяется браузерным POST.
+                preflight = GameJoinPreflight(
+                    captcha_detected=False,
+                    captcha_url="",
+                    challenge_id="",
+                    challenge_type="",
+                    encoded_metadata="",
+                    attempt_id="",
+                    request_body={},
+                )
+                LOG.write(
+                    "GAMEJOIN_CONTEXT mode=chromium_only "
+                    "python_preflight=false python_replay=false"
+                )
+            else:
+                preflight = preflight_gamejoin(session)
+                LOG.write(
+                    "GAMEJOIN_CONTEXT mode=python_fallback "
+                    "python_preflight=true"
+                )
+
+            if browser_only_gamejoin or preflight.captcha_detected:
                 replay_accepted = False
                 for captcha_attempt in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
                     LOG.write(
@@ -2003,9 +2038,9 @@ def main() -> int:
                         f"current={captcha_attempt} total={CAPTCHA_MAX_ATTEMPTS}"
                     )
                     completion = None
-                    if CAPTCHA_PLAYWRIGHT_CAPTURE and preflight.captcha_url:
+                    if browser_only_gamejoin:
                         completion = capture_captcha_with_playwright(
-                            preflight.captcha_url,
+                            "",
                             cookie,
                             preflight,
                             python_ip=python_ip,
@@ -2053,14 +2088,28 @@ def main() -> int:
                             )
                         else:
                             replay_accepted = completion.browser_replay_accepted
-                        if replay_accepted and not completion.probe_launch:
+                        if (
+                            replay_accepted
+                            and not completion.probe_launch
+                            and browser_only_gamejoin
+                        ):
+                            LOG.write(
+                                "GAMEJOIN_CONTEXT_COMPLETE mode=chromium_only "
+                                "python_replay=false browser_replay_accepted=true"
+                            )
+                        elif replay_accepted and not completion.probe_launch:
                             LOG.write(
                                 "GAMEJOIN_PYTHON_REPLAY_SKIPPED "
                                 "reason=browser_replay_accepted"
                             )
-                        elif not completion.probe_launch:
+                        elif not completion.probe_launch and not browser_only_gamejoin:
                             replay_accepted = replay_completed_gamejoin(
                                 session, completion.replay_preflight, completion
+                            )
+                        elif not completion.probe_launch:
+                            LOG.write(
+                                "GAMEJOIN_PYTHON_REPLAY_SKIPPED "
+                                "reason=chromium_only_context rejected_in_browser=true"
                             )
                     else:
                         LOG.write(
